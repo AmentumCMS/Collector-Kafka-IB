@@ -59,7 +59,7 @@ jobs:
           echo -e "\nInstall helm images plugin"
           helm plugin install https://github.com/nikhilsbhat/helm-images
           echo -e "\nImages listed in chart"
-          helm images get bitnami/kafka
+          helm images get oci://registry-1.docker.io/bitnamicharts/kafka
 
       - name: Directory Contents
         run: |
