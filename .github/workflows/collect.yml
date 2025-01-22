@@ -55,8 +55,7 @@ jobs:
           mkdir -p helmchart
           cd helmchart
           echo -e "\nSet repo and pull chart"
-          helm repo add bitnami oci://registry-1.docker.io/bitnamicharts/
-          helm pull bitnami/kafka
+          helm pull helm pull oci://registry-1.docker.io/bitnamicharts/kafka
           echo -e "\nInstall helm images plugin"
           helm plugin install https://github.com/nikhilsbhat/helm-images
           echo -e "\nImages listed in chart"
