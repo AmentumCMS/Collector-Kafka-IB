@@ -283,7 +283,6 @@ jobs:
 
       # Create Release
 
-
   Sharepoint:
     runs-on: ubuntu-24.04
     needs: [Date, MakeISO]
@@ -300,4 +299,3 @@ jobs:
         run: ls -Alht ${{ vars.COLLECTOR }}-*.*
 
       # Upload files to Sharepoint
-
