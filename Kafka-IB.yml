@@ -8,4 +8,3 @@ registry1.dso.mil:
 docker.io:
     images-by-tag-regex:
         obsidiandynamics/kafdrop: ^4.1.0$
-        bitnami/kafka: ^3.4.0$
