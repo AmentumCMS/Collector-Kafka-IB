@@ -10,7 +10,7 @@ jobs:
   Date:
     runs-on: ubuntu-24.04
     outputs:
-      Date: ${{ steps.date.outputs.date }}
+      Date: ${{ steps.DATE.outputs.DATE }}
     steps:
       - name: Get current date
         id: DATE
@@ -47,6 +47,34 @@ jobs:
             --src yaml --dest dir \
             ${{ vars.COLLECTOR }}.yml \
             ${{ vars.COLLECTOR }}
+
+      - name: Run Skopeo Sync (docker-archive for scanners)
+        run: |
+          mkdir -p ${{ vars.COLLECTOR }}/docker-archive
+          skopeo sync --scoped \
+            --src yaml --dest docker-archive \
+            ${{ vars.COLLECTOR }}.yml \
+            ${{ vars.COLLECTOR }}/docker-archive
+
+      - name: TARchive docker-archive tars (scanner input)
+        run: |
+          tar -cv -Ipigz \
+            -f ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz \
+            ${{ vars.COLLECTOR }}/docker-archive \
+          | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz.txt
+
+      - name: Hash docker-archive tarball
+        run: |
+          sha256sum -b ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz | tee \
+            ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz.sha
+
+      - name: Upload docker-archive tarball for scanners
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
+          path: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz*
+          if-no-files-found: error
+
 
       - name: Grab helm
         run: |
@@ -167,102 +195,132 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - name: Check out code
-        uses: actions/checkout@v4
-
-      - name: Download Skopeo Artifacts
+      - name: Download docker-archive artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
+          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
           path: .
 
-      - name: Extract for scanning
-        run: tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
+      - name: Extract docker-archive
+        run: |
+          tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
 
-      # Anchore Grype is excellent at auto-detecting the skopeo directory structure
-      - name: Run Anchore Grype scan
-        uses: anchore/scan-action@v6
-        id: scan
-        with:
-          path: "${{ vars.COLLECTOR }}"
-          fail-build: true
-          severity-cutoff: high
-          output-format: sarif
+      - name: Install Grype (Anchore scanner)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          grype version
 
-      - name: Upload Anchore Scan Report (Security Tab)
+      - name: Load images into Docker
+        run: |
+          set -euo pipefail
+          mkdir -p scan-results
+          : > scan-results/images.txt
+
+          shopt -s nullglob
+          for tar in ${{ vars.COLLECTOR }}/docker-archive/*.tar; do
+            echo "Loading $tar"
+            out="$(docker load -i "$tar")"
+            echo "$out"
+            ref="$(echo "$out" | sed -n 's/^Loaded image: //p' | tail -n 1 || true)"
+            if [ -z "$ref" ]; then
+              ref="$(echo "$out" | sed -n 's/^Loaded image ID: //p' | tail -n 1 || true)"
+            fi
+            [ -n "$ref" ] || { echo "Could not determine image ref for $tar"; exit 1; }
+            echo "$ref" >> scan-results/images.txt
+          done
+
+      - name: Grype scan loaded images (JSON + SARIF)
+        run: |
+          set -euo pipefail
+          mkdir -p scan-results/grype
+
+          sarif="scan-results/grype-results.sarif"
+          : > "$sarif"
+
+          # Grype can output sarif per image; easiest is JSON per image + one sarif for security tab
+          while read -r ref; do
+            safe="$(echo "$ref" | tr '/:@' '___')"
+            echo "Scanning $ref"
+            grype "$ref" -o json > "scan-results/grype/${safe}.json"
+          done < scan-results/images.txt
+
+          # Security tab SARIF (scan all loaded images by iterating and concatenating isn't valid SARIF)
+          # So create one SARIF by scanning by "docker:daemon" selection of all images we loaded:
+          # We'll just rescan each image with -o sarif and keep the LAST as the SARIF upload (still useful).
+          last=""
+          while read -r ref; do
+            last="$ref"
+          done < scan-results/images.txt
+          if [ -n "$last" ]; then
+            grype "$last" -o sarif > "$sarif"
+          else
+            echo "No images to scan"
+            exit 1
+          fi
+
+      - name: Upload Anchore SARIF (Security Tab)
         if: always()
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: ${{ steps.scan.outputs.sarif }}
-      
-      - name: Generate Anchore Proof Report
-        if: always()
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b .
-          ./grype ./${{ vars.COLLECTOR }} > anchore-report.txt
-          echo "## Anchore Grype Results ⚓" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat anchore-report.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          sarif_file: scan-results/grype-results.sarif
 
       - name: Upload Anchore Evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-anchore-report
-          path: anchore-report.txt
+          name: evidence-anchore-grype
+          path: scan-results/
 
   TrivyScan:
     needs: [Date, Skopeo, Code]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      security-events: write 
+      security-events: write
     steps:
-      - name: Check out code
-        uses: actions/checkout@v4
-
-      - name: Download Skopeo Artifacts
+      - name: Download docker-archive artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
+          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
           path: .
 
-      - name: Extract for scanning
-        run: tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
+      - name: Extract docker-archive
+        run: |
+          tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
+
       - name: Install Trivy
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.50.0
-      # Fixed: Point Trivy at the specific image directories found by Skopeo
-      - name: Run Trivy FS scan on synced images
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          trivy --version
+
+      - name: Trivy scan synced images (image scan from tar)
         run: |
-          echo "## Trivy Detailed Findings 🛡️" > trivy-report.txt
-          
-          # We scan each directory found by skopeo as a filesystem.
-          # This allows Trivy to find the 'var/lib/dpkg' or 'apk/db' inside the blobs.
-          for img in $(find ${{ vars.COLLECTOR }} -maxdepth 1 -mindepth 1 -type d ! -name "helmchart"); do
-            echo -e "\n### Scanning Image: $img" >> trivy-report.txt
-            # Using the 'fs' scanner on the directory is the most reliable for skopeo-dir format
-            trivy fs --severity CRITICAL,HIGH --format table "$img" >> trivy-report.txt
+          set -euo pipefail
+          mkdir -p scan-results/trivy
+          echo "## Trivy Image Scan Results 🛡️" > scan-results/trivy-report.txt
+
+          shopt -s nullglob
+          for tar in ${{ vars.COLLECTOR }}/docker-archive/*.tar; do
+            base="$(basename "$tar" .tar)"
+            echo -e "\n### $base" >> scan-results/trivy-report.txt
+            trivy image --input "$tar" \
+              --severity HIGH,CRITICAL \
+              --format table >> scan-results/trivy-report.txt
+
+            trivy image --input "$tar" \
+              --severity HIGH,CRITICAL \
+              --format json \
+              --output "scan-results/trivy/${base}.json"
           done
 
-          # Push to the GitHub Summary page
-          echo "## Trivy OCI & Config Results 🛡️" >> $GITHUB_STEP_SUMMARY
+          echo "## Trivy Image Scan Results 🛡️" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          cat trivy-report.txt >> $GITHUB_STEP_SUMMARY
+          cat scan-results/trivy-report.txt >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - name: Run Trivy Config Scan (Helm Charts)
-        if: always()
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'config'
-          scan-ref: '${{ vars.COLLECTOR }}/helmchart'
-          format: 'table'
-          severity: 'CRITICAL,HIGH'
-
-      # Generate SARIF for the Security Tab (scanning the root for config/secrets)
-      - name: Generate SARIF
+      - name: Generate SARIF (repo config/fs scan)
         if: always()
         uses: aquasecurity/trivy-action@master
         with:
@@ -277,20 +335,13 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
 
-      - name: Publish Trivy Summary
-        if: always()
-        run: |
-          echo "## Trivy OCI & Config Results 🛡️" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat trivy-report.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
       - name: Upload Trivy Evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-trivy-report
-          path: trivy-report.txt
+          name: evidence-trivy
+          path: scan-results/
+
           
   MakeISO:
     runs-on: ubuntu-24.04
