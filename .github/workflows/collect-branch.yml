@@ -201,33 +201,41 @@ jobs:
           echo "${{ secrets.REGISTRY_TOKEN }}" | docker login ${{ vars.REGISTRY }} \
             -u "${{ secrets.REGISTRY_USER }}" --password-stdin
 
-      - name: Parse images from ${{ vars.COLLECTOR }}.yml
+      - name: Parse images from ${{ env.COLLECTOR_YAML }}
         run: |
           set -euo pipefail
           : > images.txt
 
-          # Common skopeo sync YAML patterns supported:
-          # images:
-          #   - image: repo/name
-          #     tags: [tag1, tag2]
-          #   - image: repo/name:tag
-          #   - image: repo/name@sha256:....
-          while read -r base; do
-            [ -n "$base" ] || continue
+          # For schema:
+          # <registry>:
+          #   images-by-tag-regex:
+          #     repo/name: ^1.2.3$
+          #
+          # We convert to full refs like:
+          # <registry>/repo/name:1.2.3
 
-            tags="$(yq ".images[] | select(.image == \"$base\") | .tags[]?" -r "$COLLECTOR_YAML" 2>/dev/null || true)"
-            if [ -n "$tags" ]; then
-              while read -r t; do
-                [ -n "$t" ] || continue
-                echo "${base}:${t}" >> images.txt
-              done <<< "$tags"
-            else
-              echo "$base" >> images.txt
-            fi
-          done < <(yq '.images[].image' -r "$COLLECTOR_YAML")
+          registries="$(yq -r 'keys | .[]' "$COLLECTOR_YAML")"
+          for reg in $registries; do
+            yq -r ".\"$reg\".\"images-by-tag-regex\" // {} | to_entries[] | \"\(.key)\t\(.value)\"" "$COLLECTOR_YAML" \
+            | while IFS=$'\t' read -r imgprefix regex; do
+                # imgprefix already contains trailing ":" in your file (e.g. ironbank/bitnami/kafka:)
+                # but handle both "repo/name:" and "repo/name" defensively.
+                imgprefix="${imgprefix%:}"
+
+                # Your regex is exact-pin like ^3.4.0$ -> tag "3.4.0"
+                tag="$(echo "$regex" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\^//' -e 's/\$$//')"
+
+                if echo "$tag" | grep -Eq '[\^\$\[\]\(\)\|\*\+\?\\]'; then
+                  echo "ERROR: Non-literal tag regex for $reg/$imgprefix => $regex"
+                  echo "This parser only supports exact pins like ^1.2.3$"
+                  exit 1
+                fi
+
+                echo "${reg}/${imgprefix}:${tag}" >> images.txt
+              done
+          done
 
           sort -u images.txt -o images.txt
-
           echo "Images to scan:"
           nl -ba images.txt
           test -s images.txt
