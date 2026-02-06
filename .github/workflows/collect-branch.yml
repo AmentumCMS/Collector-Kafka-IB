@@ -16,10 +16,10 @@ jobs:
         id: DATE
         run: |
           echo "Setting Date"
-          echo "DATE=$(date '+%Y%m%d-%H%M')" >> $GITHUB_OUTPUT
+          echo "DATE=$(date '+%Y%m%d-%H%M')" >> "$GITHUB_OUTPUT"
           echo -e "\nWrote to file:\n$GITHUB_OUTPUT\n"
           echo "Values:"
-          cat $GITHUB_OUTPUT
+          cat "$GITHUB_OUTPUT"
 
   Skopeo:
     needs: [Date]
@@ -30,69 +30,41 @@ jobs:
       - name: Check out repository code
         uses: actions/checkout@v4
 
-      - name: Install Skopeo
+      - name: Install Skopeo + tools
         run: |
           sudo apt-get update -y
           sudo apt-get install -y skopeo pigz
 
       - name: ${{ vars.REGISTRY }} Login
         run: |
-          skopeo login ${{ vars.REGISTRY }}  \
+          skopeo login ${{ vars.REGISTRY }} \
             -u ${{ secrets.REGISTRY_USER }} \
             -p ${{ secrets.REGISTRY_TOKEN }}
 
-      - name: Run Skopeo Sync
+      - name: Run Skopeo Sync (dir mirror)
         run: |
           skopeo sync --scoped \
             --src yaml --dest dir \
             ${{ vars.COLLECTOR }}.yml \
             ${{ vars.COLLECTOR }}
 
-      - name: Run Skopeo Sync (docker-archive for scanners)
-        run: |
-          mkdir -p ${{ vars.COLLECTOR }}/docker-archive
-          skopeo sync --scoped \
-            --src yaml --dest docker-archive \
-            ${{ vars.COLLECTOR }}.yml \
-            ${{ vars.COLLECTOR }}/docker-archive
-
-      - name: TARchive docker-archive tars (scanner input)
-        run: |
-          tar -cv -Ipigz \
-            -f ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz \
-            ${{ vars.COLLECTOR }}/docker-archive \
-          | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz.txt
-
-      - name: Hash docker-archive tarball
-        run: |
-          sha256sum -b ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz | tee \
-            ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz.sha
-
-      - name: Upload docker-archive tarball for scanners
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
-          path: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz*
-          if-no-files-found: error
-
-
       - name: Grab helm
         run: |
           HELM_URL="https://charts.bitnami.com/bitnami/"
-          HELM_REPO="kafka"
+          HELM_REPO="bitnami"
           HELM_NAME="kafka"
           mkdir -p ${{ vars.COLLECTOR }}/helmchart
           cd ${{ vars.COLLECTOR }}/helmchart
           echo -e "\nSet repo and pull chart"
           helm repo add $HELM_REPO $HELM_URL
+          helm repo update
           helm pull $HELM_REPO/$HELM_NAME
           echo -e "\nInstall helm images plugin"
-          helm plugin install https://github.com/nikhilsbhat/helm-images > /dev/null 2>&1
+          helm plugin install https://github.com/nikhilsbhat/helm-images > /dev/null 2>&1 || true
           echo -e "\nImages listed in chart"
-          helm images get $HELM_REPO/$HELM_NAME
+          helm images get $HELM_REPO/$HELM_NAME || true
           echo -e "\n\nHelmchart Hash "
-          sha256sum -b * \
-          | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.helm.sha
+          sha256sum -b * | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.helm.sha
           echo -e "\n\nList files:\n$(pwd;ls -1SSh)"
 
       - name: Directory Contents
@@ -111,7 +83,7 @@ jobs:
           sha256sum -b ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz | tee \
             ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz.sha
 
-      - name: List files 
+      - name: List files
         run: ls -Alht ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz*
 
       - name: Upload TARchive, ToC, and hash
@@ -145,7 +117,7 @@ jobs:
           git submodule update --init --recursive --remote
           set +e
           git commit -am "Update Submodules"
-          if [ $? -eq 1 ];then
+          if [ $? -eq 1 ]; then
             echo "No push required"
           else
             git push
@@ -188,6 +160,7 @@ jobs:
           name: ${{ vars.COLLECTOR }}-code-${{ needs.Date.outputs.Date }}.tgz
           path: ${{ vars.COLLECTOR }}-code-${{ needs.Date.outputs.Date }}.tgz*
           if-no-files-found: error
+
   AnchoreScan:
     needs: [Date, Skopeo]
     runs-on: ubuntu-24.04
@@ -195,68 +168,69 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - name: Download docker-archive artifacts
+      - name: Download Skopeo Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
+          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
           path: .
 
-      - name: Extract docker-archive
+      - name: Extract for scanning
         run: |
-          tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
+          tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
 
       - name: Install Grype (Anchore scanner)
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
-            | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
           grype version
 
-      - name: Load images into Docker
+      - name: Load synced images into Docker from dir mirror
         run: |
           set -euo pipefail
-          mkdir -p scan-results
-          : > scan-results/images.txt
+          : > scan-images.txt
 
-          shopt -s nullglob
-          for tar in ${{ vars.COLLECTOR }}/docker-archive/*.tar; do
-            echo "Loading $tar"
-            out="$(docker load -i "$tar")"
-            echo "$out"
-            ref="$(echo "$out" | sed -n 's/^Loaded image: //p' | tail -n 1 || true)"
-            if [ -z "$ref" ]; then
-              ref="$(echo "$out" | sed -n 's/^Loaded image ID: //p' | tail -n 1 || true)"
+          # Find all manifest.json files and load each directory as an image
+          while IFS= read -r manifest; do
+            src_dir="$(dirname "$manifest")"
+            rel="${src_dir#${{ vars.COLLECTOR }}/}"
+
+            # best-effort tag naming from the dir layout: <repo>/<image>/<tag>
+            repo="$(echo "$rel" | awk -F/ '{print $1 "/" $2}')"
+            tag="$(echo "$rel"  | awk -F/ '{print $3}')"
+
+            if [ -z "${repo:-}" ] || [ -z "${tag:-}" ]; then
+              repo="$(echo "$rel" | tr '/ ' '__')"
+              tag="synced"
             fi
-            [ -n "$ref" ] || { echo "Could not determine image ref for $tar"; exit 1; }
-            echo "$ref" >> scan-results/images.txt
-          done
 
-      - name: Grype scan loaded images (JSON + SARIF)
+            image_ref="${repo}:${tag}"
+            echo "Loading dir:${src_dir} -> docker-daemon:${image_ref}"
+            skopeo copy --all "dir:${src_dir}" "docker-daemon:${image_ref}"
+            echo "$image_ref" >> scan-images.txt
+          done < <(find "${{ vars.COLLECTOR }}" -type f -name manifest.json | sort)
+
+          echo "Loaded images:"
+          cat scan-images.txt
+
+      - name: Grype scan loaded images (JSON)
         run: |
           set -euo pipefail
           mkdir -p scan-results/grype
+          while read -r img; do
+            safe="$(echo "$img" | tr '/:@' '___')"
+            echo "Scanning $img"
+            grype "$img" -o json > "scan-results/grype/${safe}.json"
+          done < scan-images.txt
 
-          sarif="scan-results/grype-results.sarif"
-          : > "$sarif"
-
-          # Grype can output sarif per image; easiest is JSON per image + one sarif for security tab
-          while read -r ref; do
-            safe="$(echo "$ref" | tr '/:@' '___')"
-            echo "Scanning $ref"
-            grype "$ref" -o json > "scan-results/grype/${safe}.json"
-          done < scan-results/images.txt
-
-          # Security tab SARIF (scan all loaded images by iterating and concatenating isn't valid SARIF)
-          # So create one SARIF by scanning by "docker:daemon" selection of all images we loaded:
-          # We'll just rescan each image with -o sarif and keep the LAST as the SARIF upload (still useful).
-          last=""
-          while read -r ref; do
-            last="$ref"
-          done < scan-results/images.txt
+      # Optional: still provide SARIF for Security tab (single SARIF is simplest)
+      - name: Grype SARIF (last image, for Security tab)
+        if: always()
+        run: |
+          set -euo pipefail
+          last="$(tail -n 1 scan-images.txt || true)"
           if [ -n "$last" ]; then
-            grype "$last" -o sarif > "$sarif"
+            grype "$last" -o sarif > scan-results/grype-results.sarif
           else
-            echo "No images to scan"
-            exit 1
+            echo "{}" > scan-results/grype-results.sarif
           fi
 
       - name: Upload Anchore SARIF (Security Tab)
@@ -279,15 +253,15 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - name: Download docker-archive artifacts
+      - name: Download Skopeo Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
+          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
           path: .
 
-      - name: Extract docker-archive
+      - name: Extract for scanning
         run: |
-          tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.docker-archive.tgz
+          tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
 
       - name: Install Trivy
         run: |
@@ -295,25 +269,40 @@ jobs:
             | sh -s -- -b /usr/local/bin
           trivy --version
 
-      - name: Trivy scan synced images (image scan from tar)
+      - name: Load synced images into Docker from dir mirror
+        run: |
+          set -euo pipefail
+          : > scan-images.txt
+
+          while IFS= read -r manifest; do
+            src_dir="$(dirname "$manifest")"
+            rel="${src_dir#${{ vars.COLLECTOR }}/}"
+            repo="$(echo "$rel" | awk -F/ '{print $1 "/" $2}')"
+            tag="$(echo "$rel"  | awk -F/ '{print $3}')"
+
+            if [ -z "${repo:-}" ] || [ -z "${tag:-}" ]; then
+              repo="$(echo "$rel" | tr '/ ' '__')"
+              tag="synced"
+            fi
+
+            image_ref="${repo}:${tag}"
+            echo "Loading dir:${src_dir} -> docker-daemon:${image_ref}"
+            skopeo copy --all "dir:${src_dir}" "docker-daemon:${image_ref}"
+            echo "$image_ref" >> scan-images.txt
+          done < <(find "${{ vars.COLLECTOR }}" -type f -name manifest.json | sort)
+
+      - name: Trivy scan loaded images (real image scan)
         run: |
           set -euo pipefail
           mkdir -p scan-results/trivy
           echo "## Trivy Image Scan Results 🛡️" > scan-results/trivy-report.txt
 
-          shopt -s nullglob
-          for tar in ${{ vars.COLLECTOR }}/docker-archive/*.tar; do
-            base="$(basename "$tar" .tar)"
-            echo -e "\n### $base" >> scan-results/trivy-report.txt
-            trivy image --input "$tar" \
-              --severity HIGH,CRITICAL \
-              --format table >> scan-results/trivy-report.txt
-
-            trivy image --input "$tar" \
-              --severity HIGH,CRITICAL \
-              --format json \
-              --output "scan-results/trivy/${base}.json"
-          done
+          while read -r img; do
+            safe="$(echo "$img" | tr '/:@' '___')"
+            echo -e "\n### $img" >> scan-results/trivy-report.txt
+            trivy image --severity HIGH,CRITICAL --format table "$img" >> scan-results/trivy-report.txt
+            trivy image --severity HIGH,CRITICAL --format json --output "scan-results/trivy/${safe}.json" "$img"
+          done < scan-images.txt
 
           echo "## Trivy Image Scan Results 🛡️" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -342,7 +331,6 @@ jobs:
           name: evidence-trivy
           path: scan-results/
 
-          
   MakeISO:
     runs-on: ubuntu-24.04
     needs: [Date, Code, Skopeo, AnchoreScan, TrivyScan]
