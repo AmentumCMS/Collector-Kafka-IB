@@ -161,179 +161,121 @@ jobs:
           path: ${{ vars.COLLECTOR }}-code-${{ needs.Date.outputs.Date }}.tgz*
           if-no-files-found: error
 
-  AnchoreScan:
-    needs: [Date, Skopeo]
+  ComplianceScan:
+    name: Compliance Scan (images in skopeo YAML)
+    needs: [Date]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      security-events: write
+    env:
+      COLLECTOR_YAML: ${{ vars.COLLECTOR }}.yml
+      TRIVY_SEVERITY: "HIGH,CRITICAL"   # compliance cutoff
+      GRYPE_FAIL_ON: "high"             # compliance cutoff
     steps:
-      - name: Download Skopeo Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
-          path: .
+      - name: Check out repository code
+        uses: actions/checkout@v4
 
-      - name: Extract for scanning
-        run: |
-          tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
-
-      - name: Install Grype (Anchore scanner)
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-          grype version
-
-      - name: Load synced images into Docker from dir mirror
+      - name: Install tools (yq, trivy, grype)
         run: |
           set -euo pipefail
-          : > scan-images.txt
+          sudo apt-get update -y
+          sudo apt-get install -y curl
 
-          # Find all manifest.json files and load each directory as an image
-          while IFS= read -r manifest; do
-            src_dir="$(dirname "$manifest")"
-            rel="${src_dir#${{ vars.COLLECTOR }}/}"
+          # yq
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
 
-            # best-effort tag naming from the dir layout: <repo>/<image>/<tag>
-            repo="$(echo "$rel" | awk -F/ '{print $1 "/" $2}')"
-            tag="$(echo "$rel"  | awk -F/ '{print $3}')"
-
-            if [ -z "${repo:-}" ] || [ -z "${tag:-}" ]; then
-              repo="$(echo "$rel" | tr '/ ' '__')"
-              tag="synced"
-            fi
-
-            image_ref="${repo}:${tag}"
-            echo "Loading dir:${src_dir} -> docker-daemon:${image_ref}"
-            skopeo copy --all "dir:${src_dir}" "docker-daemon:${image_ref}"
-            echo "$image_ref" >> scan-images.txt
-          done < <(find "${{ vars.COLLECTOR }}" -type f -name manifest.json | sort)
-
-          echo "Loaded images:"
-          cat scan-images.txt
-
-      - name: Grype scan loaded images (JSON)
-        run: |
-          set -euo pipefail
-          mkdir -p scan-results/grype
-          while read -r img; do
-            safe="$(echo "$img" | tr '/:@' '___')"
-            echo "Scanning $img"
-            grype "$img" -o json > "scan-results/grype/${safe}.json"
-          done < scan-images.txt
-
-      # Optional: still provide SARIF for Security tab (single SARIF is simplest)
-      - name: Grype SARIF (last image, for Security tab)
-        if: always()
-        run: |
-          set -euo pipefail
-          last="$(tail -n 1 scan-images.txt || true)"
-          if [ -n "$last" ]; then
-            grype "$last" -o sarif > scan-results/grype-results.sarif
-          else
-            echo "{}" > scan-results/grype-results.sarif
-          fi
-
-      - name: Upload Anchore SARIF (Security Tab)
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: scan-results/grype-results.sarif
-
-      - name: Upload Anchore Evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: evidence-anchore-grype
-          path: scan-results/
-
-  TrivyScan:
-    needs: [Date, Skopeo, Code]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - name: Download Skopeo Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
-          path: .
-
-      - name: Extract for scanning
-        run: |
-          tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
-
-      - name: Install Trivy
-        run: |
+          # Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin
+            | sudo sh -s -- -b /usr/local/bin
           trivy --version
 
-      - name: Load synced images into Docker from dir mirror
+          # Grype
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+          grype version
+
+      - name: Docker login (for scanners)
+        run: |
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login ${{ vars.REGISTRY }} \
+            -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: Parse images from ${{ vars.COLLECTOR }}.yml
         run: |
           set -euo pipefail
-          : > scan-images.txt
+          : > images.txt
 
-          while IFS= read -r manifest; do
-            src_dir="$(dirname "$manifest")"
-            rel="${src_dir#${{ vars.COLLECTOR }}/}"
-            repo="$(echo "$rel" | awk -F/ '{print $1 "/" $2}')"
-            tag="$(echo "$rel"  | awk -F/ '{print $3}')"
+          # Common skopeo sync YAML patterns supported:
+          # images:
+          #   - image: repo/name
+          #     tags: [tag1, tag2]
+          #   - image: repo/name:tag
+          #   - image: repo/name@sha256:....
+          while read -r base; do
+            [ -n "$base" ] || continue
 
-            if [ -z "${repo:-}" ] || [ -z "${tag:-}" ]; then
-              repo="$(echo "$rel" | tr '/ ' '__')"
-              tag="synced"
+            tags="$(yq ".images[] | select(.image == \"$base\") | .tags[]?" -r "$COLLECTOR_YAML" 2>/dev/null || true)"
+            if [ -n "$tags" ]; then
+              while read -r t; do
+                [ -n "$t" ] || continue
+                echo "${base}:${t}" >> images.txt
+              done <<< "$tags"
+            else
+              echo "$base" >> images.txt
             fi
+          done < <(yq '.images[].image' -r "$COLLECTOR_YAML")
 
-            image_ref="${repo}:${tag}"
-            echo "Loading dir:${src_dir} -> docker-daemon:${image_ref}"
-            skopeo copy --all "dir:${src_dir}" "docker-daemon:${image_ref}"
-            echo "$image_ref" >> scan-images.txt
-          done < <(find "${{ vars.COLLECTOR }}" -type f -name manifest.json | sort)
+          sort -u images.txt -o images.txt
 
-      - name: Trivy scan loaded images (real image scan)
+          echo "Images to scan:"
+          nl -ba images.txt
+          test -s images.txt
+
+      - name: Trivy scan images (fail on HIGH/CRITICAL)
         run: |
           set -euo pipefail
           mkdir -p scan-results/trivy
-          echo "## Trivy Image Scan Results 🛡️" > scan-results/trivy-report.txt
 
           while read -r img; do
             safe="$(echo "$img" | tr '/:@' '___')"
-            echo -e "\n### $img" >> scan-results/trivy-report.txt
-            trivy image --severity HIGH,CRITICAL --format table "$img" >> scan-results/trivy-report.txt
-            trivy image --severity HIGH,CRITICAL --format json --output "scan-results/trivy/${safe}.json" "$img"
-          done < scan-images.txt
+            echo "Trivy scanning $img"
 
-          echo "## Trivy Image Scan Results 🛡️" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat scan-results/trivy-report.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+            # Fail build if findings at/beyond TRIVY_SEVERITY exist
+            trivy image \
+              --severity "$TRIVY_SEVERITY" \
+              --exit-code 1 \
+              --format json \
+              --output "scan-results/trivy/${safe}.json" \
+              "$img"
+          done < images.txt
 
-      - name: Generate SARIF (repo config/fs scan)
-        if: always()
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
+      - name: Grype scan images (fail on high)
+        run: |
+          set -euo pipefail
+          mkdir -p scan-results/grype
 
-      - name: Upload SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: 'trivy-results.sarif'
+          while read -r img; do
+            safe="$(echo "$img" | tr '/:@' '___')"
+            echo "Grype scanning $img"
 
-      - name: Upload Trivy Evidence
+            # Fail build if >= GRYPE_FAIL_ON exists
+            grype "$img" \
+              --fail-on "$GRYPE_FAIL_ON" \
+              -o json > "scan-results/grype/${safe}.json"
+          done < images.txt
+
+      - name: Upload compliance evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-trivy
+          name: compliance-scan-${{ needs.Date.outputs.Date }}
           path: scan-results/
+          if-no-files-found: error
 
   MakeISO:
     runs-on: ubuntu-24.04
-    needs: [Date, Code, Skopeo, AnchoreScan, TrivyScan]
+    needs: [Date, Code, Skopeo, ComplianceScan]
     env:
       GH_TOKEN: ${{ github.token }}
     permissions:
@@ -360,20 +302,21 @@ jobs:
       - name: Pull helm chart
         run: |
           HELM_URL="https://charts.bitnami.com/bitnami/"
-          HELM_REPO="kafka"
+          HELM_REPO="bitnami"
           HELM_NAME="kafka"
           mkdir -p ${{ vars.COLLECTOR }}/helmchart
           cd ${{ vars.COLLECTOR }}/helmchart
           echo -e "\nSet repo and pull chart"
           helm repo add $HELM_REPO $HELM_URL
+          helm repo update
           helm pull $HELM_REPO/$HELM_NAME
           echo -e "\nInstall helm images plugin"
-          helm plugin install https://github.com/nikhilsbhat/helm-images > /dev/null 2>&1
+          helm plugin install https://github.com/nikhilsbhat/helm-images > /dev/null 2>&1 || true
           echo -e "\nImages listed in chart"
-          helm images get $HELM_REPO/$HELM_NAME
+          helm images get $HELM_REPO/$HELM_NAME || true
           echo -e "\n\nHelmchart Hash "
           sha256sum -b * \
-          | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.helm.sha
+            | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.helm.sha
           echo -e "\n\nList files:\n$(pwd;ls -1SSh)"
 
       - name: Upload Helmchart
@@ -425,7 +368,7 @@ jobs:
       - name: Generate ISO Hash
         run: |
           sha256sum -b ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.iso \
-          | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.iso.sha
+            | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.iso.sha
 
       - name: Show ISO & Hash
         run: ls -Alht *.iso*
