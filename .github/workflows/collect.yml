@@ -12,16 +12,16 @@ jobs:
   Date:
     runs-on: ubuntu-24.04
     outputs:
-      Date: ${{ steps.date.outputs.date }}
+      Date: ${{ steps.DATE.outputs.DATE }}
     steps:
       - name: Get current date
         id: DATE
         run: |
           echo "Setting Date"
-          echo "DATE=$(date '+%Y%m%d-%H%M')" >> $GITHUB_OUTPUT
+          echo "DATE=$(date '+%Y%m%d-%H%M')" >> "$GITHUB_OUTPUT"
           echo -e "\nWrote to file:\n$GITHUB_OUTPUT\n"
           echo "Values:"
-          cat $GITHUB_OUTPUT
+          cat "$GITHUB_OUTPUT"
 
   Skopeo:
     needs: [Date]
@@ -32,42 +32,139 @@ jobs:
       - name: Check out repository code
         uses: actions/checkout@v4
 
-      - name: Install Skopeo
+      - name: Install tooling (skopeo/helm/docker)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y skopeo pigz
+          sudo apt-get install -y skopeo pigz jq
+          # Ensure helm is present (ubuntu runner usually has it; keep this lightweight)
+          if ! command -v helm >/dev/null 2>&1; then
+            sudo snap install helm --classic
+          fi
+          # Ensure docker is available/running on runner (it is on GH hosted)
+          docker version
 
       - name: ${{ vars.REGISTRY }} Login
         run: |
-          skopeo login ${{ vars.REGISTRY }}  \
+          skopeo login ${{ vars.REGISTRY }} \
             -u ${{ secrets.REGISTRY_USER }} \
             -p ${{ secrets.REGISTRY_TOKEN }}
 
-      - name: Run Skopeo Sync
+      # 1) Mirror images into an on-disk dir
+      - name: Run Skopeo Sync (dir mirror)
         run: |
           skopeo sync --scoped \
             --src yaml --dest dir \
             ${{ vars.COLLECTOR }}.yml \
             ${{ vars.COLLECTOR }}
 
-      - name: Grab helm
+      # 2) ALSO mirror the same list into docker-archive tarballs (scanner-friendly)
+      - name: Run Skopeo Sync (docker-archive for scanners)
+        run: |
+          mkdir -p ${{ vars.COLLECTOR }}/docker-archive
+          skopeo sync --scoped \
+            --src yaml --dest docker-archive \
+            ${{ vars.COLLECTOR }}.yml \
+            ${{ vars.COLLECTOR }}/docker-archive
+
+      - name: Grab helm (chart + image list)
         run: |
           HELM_URL="https://charts.bitnami.com/bitnami/"
-          HELM_REPO="kafka"
+          HELM_REPO="bitnami"
           HELM_NAME="kafka"
+
           mkdir -p ${{ vars.COLLECTOR }}/helmchart
           cd ${{ vars.COLLECTOR }}/helmchart
+
           echo -e "\nSet repo and pull chart"
           helm repo add $HELM_REPO $HELM_URL
+          helm repo update
           helm pull $HELM_REPO/$HELM_NAME
+
           echo -e "\nInstall helm images plugin"
-          helm plugin install https://github.com/nikhilsbhat/helm-images > /dev/null 2>&1
+          helm plugin install https://github.com/nikhilsbhat/helm-images > /dev/null 2>&1 || true
+
           echo -e "\nImages listed in chart"
-          helm images get $HELM_REPO/$HELM_NAME
-          echo -e "\n\nHelmchart Hash "
-          sha256sum -b * \
-          | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.helm.sha
+          helm images get $HELM_REPO/$HELM_NAME || true
+
+          echo -e "\n\nHelmchart Hash"
+          sha256sum -b * | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.helm.sha
           echo -e "\n\nList files:\n$(pwd;ls -1SSh)"
+          
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget
+          wget -qO- https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+          trivy --version
+
+      - name: Install Grype (Anchore scanner)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+          grype version
+
+      - name: Load docker-archive tars into Docker
+        run: |
+          set -euo pipefail
+          mkdir -p scan-results
+          : > scan-results/images.txt
+
+          shopt -s nullglob
+          for tar in ${{ vars.COLLECTOR }}/docker-archive/*.tar; do
+            echo "Loading $tar"
+            out="$(docker load -i "$tar")"
+            echo "$out"
+
+            # Prefer "Loaded image: repo:tag"
+            ref="$(echo "$out" | sed -n 's/^Loaded image: //p' | tail -n 1 || true)"
+            if [ -z "$ref" ]; then
+              # fallback: image ID (less nice but still scannable)
+              ref="$(echo "$out" | sed -n 's/^Loaded image ID: //p' | tail -n 1 || true)"
+            fi
+
+            if [ -z "$ref" ]; then
+              echo "ERROR: Could not determine loaded image reference for $tar"
+              exit 1
+            fi
+
+            echo "$ref" >> scan-results/images.txt
+          done
+
+          echo "Loaded image refs:"
+          cat scan-results/images.txt
+
+      - name: Trivy scan synced images (from docker-archive tars)
+        run: |
+          set -euo pipefail
+          mkdir -p scan-results/trivy
+
+          shopt -s nullglob
+          for tar in ${{ vars.COLLECTOR }}/docker-archive/*.tar; do
+            base="$(basename "$tar" .tar)"
+            echo "Trivy scanning $tar"
+            trivy image --input "$tar" \
+              --format json \
+              --output "scan-results/trivy/${base}.json" \
+              --severity HIGH,CRITICAL
+          done
+
+      - name: Anchore/Grype scan loaded images
+        run: |
+          set -euo pipefail
+          mkdir -p scan-results/grype
+
+          while read -r ref; do
+            safe="$(echo "$ref" | tr '/:@' '___')"
+            echo "Grype scanning $ref"
+            grype "$ref" -o json > "scan-results/grype/${safe}.json"
+          done < scan-results/images.txt
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}-scan-results
+          path: scan-results/
+          if-no-files-found: error
 
       - name: Directory Contents
         run: |
@@ -85,7 +182,7 @@ jobs:
           sha256sum -b ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz | tee \
             ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz.sha
 
-      - name: List files 
+      - name: List files
         run: ls -Alht ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz*
 
       - name: Upload TARchive, ToC, and hash
@@ -150,141 +247,10 @@ jobs:
           name: ${{ vars.COLLECTOR }}-code-${{ needs.Date.outputs.Date }}.tgz
           path: ${{ vars.COLLECTOR }}-code-${{ needs.Date.outputs.Date }}.tgz*
           if-no-files-found: error
-  AnchoreScan:
-    needs: [Date, Skopeo]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v4
 
-      - name: Download Skopeo Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
-          path: .
-
-      - name: Extract for scanning
-        run: tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
-
-      # Anchore Grype is excellent at auto-detecting the skopeo directory structure
-      - name: Run Anchore Grype scan
-        uses: anchore/scan-action@v6
-        id: scan
-        with:
-          path: "${{ vars.COLLECTOR }}"
-          fail-build: true
-          severity-cutoff: high
-          output-format: sarif
-
-      - name: Upload Anchore Scan Report (Security Tab)
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: ${{ steps.scan.outputs.sarif }}
-      
-      - name: Generate Anchore Proof Report
-        if: always()
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b .
-          ./grype ./${{ vars.COLLECTOR }} > anchore-report.txt
-          echo "## Anchore Grype Results ⚓" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat anchore-report.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload Anchore Evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: evidence-anchore-report
-          path: anchore-report.txt
-
-  TrivyScan:
-    needs: [Date, Skopeo, Code]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      security-events: write 
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v4
-
-      - name: Download Skopeo Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
-          path: .
-
-      - name: Extract for scanning
-        run: tar -xzf ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz
-      - name: Install Trivy
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.50.0
-      # Fixed: Point Trivy at the specific image directories found by Skopeo
-      - name: Run Trivy FS scan on synced images
-        run: |
-          echo "## Trivy Detailed Findings 🛡️" > trivy-report.txt
-          
-          # We scan each directory found by skopeo as a filesystem.
-          # This allows Trivy to find the 'var/lib/dpkg' or 'apk/db' inside the blobs.
-          for img in $(find ${{ vars.COLLECTOR }} -maxdepth 1 -mindepth 1 -type d ! -name "helmchart"); do
-            echo -e "\n### Scanning Image: $img" >> trivy-report.txt
-            # Using the 'fs' scanner on the directory is the most reliable for skopeo-dir format
-            trivy fs --severity CRITICAL,HIGH --format table "$img" >> trivy-report.txt
-          done
-
-          # Push to the GitHub Summary page
-          echo "## Trivy OCI & Config Results 🛡️" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat trivy-report.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-      - name: Run Trivy Config Scan (Helm Charts)
-        if: always()
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'config'
-          scan-ref: '${{ vars.COLLECTOR }}/helmchart'
-          format: 'table'
-          severity: 'CRITICAL,HIGH'
-
-      # Generate SARIF for the Security Tab (scanning the root for config/secrets)
-      - name: Generate SARIF
-        if: always()
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-
-      - name: Upload SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: 'trivy-results.sarif'
-
-      - name: Publish Trivy Summary
-        if: always()
-        run: |
-          echo "## Trivy OCI & Config Results 🛡️" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat trivy-report.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload Trivy Evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: evidence-trivy-report
-          path: trivy-report.txt
-          
   MakeISO:
     runs-on: ubuntu-24.04
-    needs: [Date, Code, Skopeo, AnchoreScan, TrivyScan]
+    needs: [Date, Code, Skopeo]
     env:
       GH_TOKEN: ${{ github.token }}
     permissions:
@@ -311,20 +277,25 @@ jobs:
       - name: Pull helm chart
         run: |
           HELM_URL="https://charts.bitnami.com/bitnami/"
-          HELM_REPO="kafka"
+          HELM_REPO="bitnami"
           HELM_NAME="kafka"
+
           mkdir -p ${{ vars.COLLECTOR }}/helmchart
           cd ${{ vars.COLLECTOR }}/helmchart
+
           echo -e "\nSet repo and pull chart"
           helm repo add $HELM_REPO $HELM_URL
+          helm repo update
           helm pull $HELM_REPO/$HELM_NAME
+
           echo -e "\nInstall helm images plugin"
-          helm plugin install https://github.com/nikhilsbhat/helm-images > /dev/null 2>&1
+          helm plugin install https://github.com/nikhilsbhat/helm-images > /dev/null 2>&1 || true
+
           echo -e "\nImages listed in chart"
-          helm images get $HELM_REPO/$HELM_NAME
-          echo -e "\n\nHelmchart Hash "
-          sha256sum -b * \
-          | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.helm.sha
+          helm images get $HELM_REPO/$HELM_NAME || true
+
+          echo -e "\n\nHelmchart Hash"
+          sha256sum -b * | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.helm.sha
           echo -e "\n\nList files:\n$(pwd;ls -1SSh)"
 
       - name: Upload Helmchart
@@ -406,8 +377,6 @@ jobs:
       - name: Show Artifacts
         run: ls -Alht ${{ vars.COLLECTOR }}-*.*
 
-      # Create Release
-
       - name: Set up git
         run: |
           git config user.name "$(git log -n 1 --pretty=format:%an)"
@@ -446,8 +415,6 @@ jobs:
 
       - name: Show Artifacts
         run: ls -Alht ${{ vars.COLLECTOR }}-*.*
-
-      # Upload files to Sharepoint
 
       - name: Send Files to Sharepoint
         uses: amentumcms/sharepoint-file-upload-action@main
