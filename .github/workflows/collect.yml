@@ -79,7 +79,8 @@ jobs:
 
       - name: TARchive Skopeo Output
         run: |
-          tar -cv -Ipigz --remove-files \
+          tar -cv --remove-files \
+            -I 'pigz -9' \
             -f ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz ${{ vars.COLLECTOR }} \
           | tee ${{ vars.COLLECTOR }}-${{ needs.Date.outputs.Date }}.tgz.txt
 
