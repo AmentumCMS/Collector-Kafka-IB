@@ -1,15 +1,9 @@
-[submodule "bitnami-kafka-ib-source"]
-	path = bitnami-kafka-ib-source
-	url = https://repo1.dso.mil/dsop/bitnami/kafka.git
-[submodule "bitnami-zookeeper-lts-source"]
-	path = bitnami-zookeeper-lts-ib-source
-	url = https://repo1.dso.mil/dsop/bitnami/zookeeper/zookeeper-lts.git
-[submodule "bitnami-zookeeper-latest-source"]
-	path = bitnami-zookeeper-latest-ib-source
-	url = https://repo1.dso.mil/dsop/bitnami/zookeeper/zookeeper-latest.git
 [submodule "operator-source"]
 	path = operator-source
 	url = https://repo1.dso.mil/dsop/opensource/strimzi/operator.git
 [submodule "jmx-exporter-ib-source"]
 	path = jmx-exporter-ib-source
 	url = https://repo1.dso.mil/dsop/opensource/prometheus/jmx-exporter.git
+[submodule "kafka-native-ib"]
+	path = kafka-native-ib
+	url = https://repo1.dso.mil/dsop/opensource/apache/kafka-native
